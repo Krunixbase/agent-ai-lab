@@ -1,109 +1,77 @@
-from typing import Any, Dict, List, Optional
+from typing import Optional, Dict, Any
+
+from pipelines.llm_pipeline import LLMPipeline
+from pipelines.retrieval_pipeline import RetrievalPipeline
 
 from .memory import Memory
+from .reasoning import ReasoningEngine
 from .tools import ToolRegistry
+
+# --- utils ---
+from utils.uuid import short_uuid
+from utils.timing import measure_time
+from utils.validators import ensure_not_empty
+from utils.formatting import truncate, pretty_json
 
 
 class BaseAgent:
     """
-    Core agent orchestrating:
-    - planning (via pipeline)
-    - tool execution (via ToolRegistry)
-    - memory updates
-    Supports both single-step and multi-step plans.
+    Core agent class orchestrating:
+    - reasoning loop
+    - memory
+    - retrieval
+    - tool execution
+    - LLM calls
     """
 
-    def __init__(self, pipeline, tools: Optional[ToolRegistry] = None, memory: Optional[Memory] = None):
-        self.pipeline = pipeline
-        self.tools = tools or ToolRegistry()
-        self.memory = memory or Memory()
+    def __init__(
+        self,
+        llm: LLMPipeline,
+        retriever: Optional[RetrievalPipeline] = None,
+    ):
+        self.llm = llm
+        self.retriever = retriever
+        self.memory = Memory()
+        self.reasoning = ReasoningEngine()
+        self.tools = ToolRegistry()
 
-    def _execute_action(self, action: str, tool_input: str) -> str:
+        # Unique session identifier
+        self.session_id = short_uuid()
+
+    # -------------------------------------------------------------------------
+    # MAIN ENTRY POINT
+    # -------------------------------------------------------------------------
+
+    @measure_time
+    async def run(self, prompt: str) -> Dict[str, Any]:
         """
-        Executes a single tool action using the ToolRegistry.
+        Main agent execution loop.
         """
-        tool = self.tools.get(action)
-        if tool is None:
-            return f"Error: unknown tool '{action}'."
 
-        try:
-            return tool(tool_input)
-        except Exception as e:
-            return f"Error while executing tool '{action}': {e}"
+        # Validate input
+        ensure_not_empty(prompt, name="prompt")
 
-    def _run_single_step(self, plan: Dict[str, Any], user_input: str) -> str:
-        """
-        Backwards-compatible single-step execution:
-        { "action": "...", "input": "..." }
-        """
-        action = plan.get("action", "echo")
-        tool_input = plan.get("input", user_input)
+        # 1. Retrieve context (RAG)
+        context = ""
+        if self.retriever:
+            results = await self.retriever.search(prompt, top_k=3)
+            context = "\n".join([r["text"] for r in results])
 
-        result = self._execute_action(action, tool_input)
+        # 2. Build system prompt
+        system_prompt = self.reasoning.build_system_prompt(context=context)
 
-        self.memory.add(
-            {
-                "user": user_input,
-                "plan": plan,
-                "result": result,
-            }
+        # 3. Generate LLM response
+        response = await self.llm.generate(
+            prompt=f"{system_prompt}\nUser: {prompt}"
         )
 
-        return result
+        # 4. Store memory
+        self.memory.add_interaction(prompt, response["text"])
 
-    def _run_multi_step(self, steps: List[Dict[str, Any]], user_input: str) -> str:
-        """
-        Executes a multi-step plan:
-        { "steps": [ { "action": "...", "input": "..." }, ... ] }
-        """
-        execution_trace: List[Dict[str, Any]] = []
-        last_result: str = ""
-
-        for idx, step in enumerate(steps):
-            action = step.get("action", "echo")
-            tool_input = step.get("input", "")
-
-            # Optionally allow referring to previous result
-            if tool_input == "" and last_result:
-                tool_input = last_result
-
-            result = self._execute_action(action, tool_input)
-            last_result = result
-
-            execution_trace.append(
-                {
-                    "step": idx,
-                    "action": action,
-                    "input": tool_input,
-                    "result": result,
-                }
-            )
-
-        self.memory.add(
-            {
-                "user": user_input,
-                "plan": {"steps": steps},
-                "trace": execution_trace,
-                "final_result": last_result,
-            }
-        )
-
-        return last_result
-
-    def run(self, user_input: str) -> str:
-        """
-        Main entrypoint for the agent.
-
-        1. Ask the pipeline for a plan.
-        2. If the plan contains `steps`, run multi-step execution.
-        3. Otherwise, fall back to single-step execution.
-        """
-        plan = self.pipeline.plan(user_input)
-
-        # Multi-step plan: { "steps": [ ... ] }
-        if isinstance(plan, dict) and "steps" in plan and isinstance(plan["steps"], list):
-            return self._run_multi_step(plan["steps"], user_input)
-
-        # Single-step plan: { "action": "...", "input": "..." }
-        return self._run_single_step(plan, user_input)
-
+        # 5. Return final output (clean + readable)
+        return {
+            "session_id": self.session_id,
+            "response": response["text"],
+            "context_used": truncate(context, 500),
+            "raw": pretty_json(response["raw"]),
+        }

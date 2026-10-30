@@ -1,25 +1,37 @@
-FROM python:3.11-slim
-
-# Prevent Python from writing .pyc files
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+# ---------- Stage 1: builder ----------
+FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy project files
-COPY pyproject.toml .
 COPY requirements.txt .
-COPY src ./src
-COPY docs ./docs
+COPY pyproject.toml .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# ---------- Stage 2: runtime ----------
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app/src
+
+WORKDIR /app
+
+# Create non-root user
+RUN useradd -m appuser
+
+# Copy installed dependencies
+COPY --from=builder /install /usr/local
+
+# Copy application code
+COPY src ./src
+
+# Give permissions to the user
+RUN chown -R appuser:appuser /app
+
+# Switch to non-root user
+USER appuser
 
 EXPOSE 8000
 
-CMD ["uvicorn", "src.server.api:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "src.api.api:create_app", "--host", "0.0.0.0", "--port", "8000"]

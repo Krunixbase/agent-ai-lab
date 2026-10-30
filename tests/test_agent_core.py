@@ -1,14 +1,17 @@
-from src.agent_core.base_agent import BaseAgent
-from src.agent_core.memory import Memory
-from src.agent_core.tools import ToolRegistry
-from src.pipelines.llm_pipeline import LLMPipeline
+import pytest
+import asyncio
 
-def test_agent_echo():
-    llm = LLMPipeline()
-    memory = Memory()
-    tools = ToolRegistry()
+from agent_core.base_agent import BaseAgent
+from pipelines.llm_pipeline import LLMPipeline
 
-    agent = BaseAgent(llm=llm, memory=memory, tools=tools)
-    result = agent.run("hello")
 
-    assert "hello" in result
+class DummyLLM(LLMPipeline):
+    async def generate(self, prompt: str):
+        return {"text": "hello", "raw": {}}
+
+
+@pytest.mark.asyncio
+async def test_agent_run():
+    agent = BaseAgent(llm=DummyLLM())
+    result = await agent.run("hi")
+    assert "response" in result
